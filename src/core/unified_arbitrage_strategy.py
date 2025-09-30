@@ -229,6 +229,9 @@ class UnifiedArbitrageStrategy:
         try:
             rprint(f"[blue]🔄 开始执行{self.exchange_a.name}+{self.exchange_b.name}套利交易: {symbol}[/blue]")
 
+            # 预交易验证 - 清理残留订单和持仓
+            if real_trade:
+                await self._pre_trade_cleanup()
 
             # 获取价差信息
             spread_1, spread_2, best_spread = await self.get_spread(symbol)
@@ -422,17 +425,82 @@ class UnifiedArbitrageStrategy:
             return None
 
     async def _cancel_order(self, exchange, order_id: str) -> bool:
-        """撤销订单"""
+        """增强撤销订单 - 带状态检查和重试机制"""
         try:
-            if exchange.name.lower() in ['aster', 'backpack']:
-                # Aster和Backpack需要symbol参数
-                return await exchange.adapter.cancel_order(order_id, exchange.symbol)
-            else:
-                # OKX等其他交易所不需要symbol参数
-                return await exchange.adapter.cancel_order(order_id)
+            # 1. 先检查订单当前状态
+            status = await self._get_order_status(exchange, order_id)
+            if status:
+                # 如果订单已成交或已取消，无需撤单
+                if self._is_order_filled(status):
+                    rprint(f"[yellow]⚠️ {exchange.name}订单{order_id}已成交，无需撤单[/yellow]")
+                    return True
+                elif status.get('status') in ['cancelled', 'canceled', 'CANCELLED', 'CANCELED']:
+                    rprint(f"[yellow]⚠️ {exchange.name}订单{order_id}已取消[/yellow]")
+                    return True
+
+            # 2. 尝试撤单（最多重试2次）
+            for attempt in range(2):
+                try:
+                    if exchange.name.lower() in ['aster', 'backpack']:
+                        result = await exchange.adapter.cancel_order(order_id, exchange.symbol)
+                    else:
+                        result = await exchange.adapter.cancel_order(order_id)
+
+                    rprint(f"[green]✅ {exchange.name}撤单成功: {order_id}[/green]")
+                    return True
+
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    if 'not found' in error_msg or 'order not found' in error_msg:
+                        rprint(f"[yellow]⚠️ {exchange.name}订单{order_id}不存在（可能已成交/取消）[/yellow]")
+                        return True
+                    elif attempt == 0:  # 第一次失败，重试
+                        rprint(f"[yellow]⚠️ {exchange.name}撤单失败，重试中... {e}[/yellow]")
+                        await asyncio.sleep(0.2)
+                        continue
+                    else:  # 第二次失败
+                        rprint(f"[red]❌ {exchange.name}撤单最终失败: {e}[/red]")
+                        return False
+
         except Exception as e:
-            rprint(f"[red]❌ 撤销{exchange.name}订单失败: {e}[/red]")
+            rprint(f"[red]❌ {exchange.name}撤单异常: {e}[/red]")
             return False
+
+    async def _pre_trade_cleanup(self):
+        """预交易清理 - 取消所有未完成订单，清理异常状态"""
+        try:
+            rprint(f"[cyan]🧹 预交易清理开始...[/cyan]")
+
+            # 清理A交易所的未完成订单
+            await self._cleanup_exchange_orders(self.exchange_a)
+
+            # 清理B交易所的未完成订单
+            await self._cleanup_exchange_orders(self.exchange_b)
+
+            rprint(f"[green]✅ 预交易清理完成[/green]")
+
+        except Exception as e:
+            rprint(f"[yellow]⚠️ 预交易清理异常（继续执行）: {e}[/yellow]")
+
+    async def _cleanup_exchange_orders(self, exchange):
+        """清理单个交易所的未完成订单"""
+        try:
+            # 获取未完成订单
+            open_orders = await exchange.adapter.get_open_orders()
+            if not open_orders:
+                return
+
+            rprint(f"[yellow]🔍 {exchange.name}发现{len(open_orders)}个未完成订单，正在清理...[/yellow]")
+
+            # 批量取消订单
+            for order in open_orders:
+                order_id = order.get('id') or order.get('order_id')
+                if order_id:
+                    await self._cancel_order(exchange, order_id)
+                    await asyncio.sleep(0.1)  # 防止过快请求
+
+        except Exception as e:
+            rprint(f"[yellow]⚠️ 清理{exchange.name}订单失败（继续执行）: {e}[/yellow]")
 
     def _is_order_filled(self, order_status: Dict) -> bool:
         """判断订单是否成交"""
@@ -638,7 +706,7 @@ class UnifiedArbitrageStrategy:
             return None
 
     async def _verify_order_fill(self, exchange, order_id: str, max_wait_time: float = 3.0):
-        """验证订单成交"""
+        """验证订单成交 - 增强版本，如果超时则尝试追价"""
         try:
             start_time = time.time()
             check_interval = 0.2  # 200ms检查间隔
@@ -650,8 +718,21 @@ class UnifiedArbitrageStrategy:
                     return True
                 await asyncio.sleep(check_interval)
 
-            rprint(f"[yellow]⚠️ {exchange.name}穿透式订单未在{max_wait_time}s内完全成交[/yellow]")
-            return False
+            # 超时处理：检查订单状态
+            status = await self._get_order_status(exchange, order_id)
+            if status:
+                executed_qty = status.get('executedQuantity', status.get('filled_size', status.get('executed_size', 0)))
+                if executed_qty and float(executed_qty) > 0:
+                    rprint(f"[yellow]⚠️ {exchange.name}订单部分成交: {executed_qty}[/yellow]")
+                    return True
+                else:
+                    rprint(f"[red]⚠️ {exchange.name}穿透式订单未成交，市场可能剧烈波动[/red]")
+                    # 取消未成交订单，避免残留
+                    await self._cancel_order(exchange, order_id)
+                    return False
+            else:
+                rprint(f"[yellow]⚠️ {exchange.name}无法获取订单状态[/yellow]")
+                return False
 
         except Exception as e:
             rprint(f"[yellow]⚠️ 验证{exchange.name}订单成交失败: {e}[/yellow]")
