@@ -21,8 +21,8 @@ class SpreadAnalyzer:
         self.data_dir = Path(data_dir)
         self.data = {}
 
-        # 设置中文字体和样式
-        plt.rcParams['font.sans-serif'] = ['Arial', 'SimHei']
+        # 设置英文字体和样式
+        plt.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans']
         plt.rcParams['axes.unicode_minus'] = False
         sns.set_style("whitegrid")
 
@@ -129,9 +129,9 @@ class SpreadAnalyzer:
                 ax = axes[row, col]
 
                 # 绘制价差分布直方图
-                ax.hist(df['spread_1'], bins=50, alpha=0.7, label='A买→B卖', color='blue')
-                ax.hist(df['spread_2'], bins=50, alpha=0.7, label='B买→A卖', color='red')
-                ax.axvline(x=1.0, color='green', linestyle='--', label='盈利线(+1)')
+                ax.hist(df['spread_1'], bins=50, alpha=0.7, label='A→B Spread', color='blue')
+                ax.hist(df['spread_2'], bins=50, alpha=0.7, label='B→A Spread', color='red')
+                ax.axvline(x=1.0, color='green', linestyle='--', label='Profit Line (+1)')
                 ax.axvline(x=-1.0, color='green', linestyle='--')
                 ax.set_title(f'{symbol} Spread Distribution')
                 ax.set_xlabel('Spread (USD)')
@@ -156,21 +156,27 @@ class SpreadAnalyzer:
         for i, (symbol, df) in enumerate(self.data.items()):
             ax = axes[i]
 
+            # 确保数值列为数值类型
+            numeric_columns = ['spread_1', 'spread_2', 'best_spread']
+            for col in numeric_columns:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+
             # 重采样为分钟数据
-            df_resampled = df.set_index('datetime').resample('1T').mean()
+            df_resampled = df.set_index('datetime')[numeric_columns].resample('1T').mean()
 
             ax.plot(df_resampled.index, df_resampled['spread_1'],
-                   label='A买→B卖', alpha=0.8, linewidth=1)
+                   label='A→B Spread', alpha=0.8, linewidth=1)
             ax.plot(df_resampled.index, df_resampled['spread_2'],
-                   label='B买→A卖', alpha=0.8, linewidth=1)
-            ax.axhline(y=1.0, color='green', linestyle='--', alpha=0.7, label='盈利线')
+                   label='B→A Spread', alpha=0.8, linewidth=1)
+            ax.axhline(y=1.0, color='green', linestyle='--', alpha=0.7, label='Profit Line')
             ax.axhline(y=-1.0, color='green', linestyle='--', alpha=0.7)
             ax.fill_between(df_resampled.index, 1.0, df_resampled['spread_1'],
                            where=(df_resampled['spread_1'] > 1.0),
-                           alpha=0.3, color='green', label='盈利区域1')
+                           alpha=0.3, color='green', label='Profit Zone 1')
             ax.fill_between(df_resampled.index, -1.0, df_resampled['spread_2'],
                            where=(df_resampled['spread_2'] > 1.0),
-                           alpha=0.3, color='red', label='盈利区域2')
+                           alpha=0.3, color='red', label='Profit Zone 2')
 
             ax.set_title(f'{symbol} Spread Time Series')
             ax.set_xlabel('Time')
@@ -254,8 +260,14 @@ class SpreadAnalyzer:
         base_time = None
 
         for symbol, df in self.data.items():
+            # 确保数值列为数值类型
+            numeric_columns = ['spread_1', 'spread_2', 'best_spread']
+            for col in numeric_columns:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+
             # 重采样为分钟数据
-            df_resampled = df.set_index('datetime').resample('1T').mean()
+            df_resampled = df.set_index('datetime')[numeric_columns].resample('1T').mean()
             correlation_data[f'{symbol}_spread_1'] = df_resampled['spread_1']
             correlation_data[f'{symbol}_spread_2'] = df_resampled['spread_2']
             correlation_data[f'{symbol}_best'] = df_resampled['best_spread']
