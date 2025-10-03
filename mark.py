@@ -30,7 +30,7 @@ class SpreadRecorder:
 
         # 配置参数
         self.symbols = ['BTCUSDT', 'ETHUSDT']  # 支持的交易对
-        self.record_interval = 1.0  # 记录间隔(秒)
+        self.record_interval = 0.5  # 记录间隔(秒)
         self.data_dir = Path('spread_data')
 
         # 数据存储

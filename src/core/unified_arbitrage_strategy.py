@@ -34,6 +34,7 @@ class ArbitragePosition:
     entry_price_b: float
     entry_spread: float
     entry_time: datetime
+    strategy_type: str = "convergence"  # convergence(相向) 或 divergence(反向)
     order_id_a: str = None
     order_id_b: str = None
     status: str = "pending"
@@ -50,6 +51,19 @@ class UnifiedArbitrageStrategy:
         self.positions: List[ArbitragePosition] = []
         self.monitoring_active = False
 
+        # 价差阈值配置
+        self.spread_threshold_open = 75  # 价差>75开仓（相向下单）
+        self.spread_threshold_reverse = 60  # 价差<60反向下单
+
+        # 平仓保护配置
+        self.min_hold_time = 60  # 最小持仓时间60秒，避免开仓后立即平仓
+
+        # 🔥 加仓配置（风险控制：只允许加仓一次）
+        self.allow_add_position = True  # 是否允许加仓
+        self.has_added_position = False  # 是否已经加仓过（只允许一次）
+        self.add_position_hold_time = 30  # 加仓需等待30秒后才可触发
+        # 加仓条件：相向策略价差>原价差120%，反向策略价差<原价差80%
+
         # 高频盘口缓存
         self._orderbook_cache_a = None
         self._orderbook_cache_b = None
@@ -58,6 +72,7 @@ class UnifiedArbitrageStrategy:
         self._cache_ttl = 0.05  # 50ms缓存有效期
 
         rprint(f"[green]🔗 使用统一套利策略: {exchange_a.name}+{exchange_b.name}[/green]")
+        rprint(f"[cyan]📊 价差阈值: 开仓>{self.spread_threshold_open}, 反向<{self.spread_threshold_reverse}[/cyan]")
 
     async def _check_account_balance(self, amount: float) -> bool:
         """检查账户余额和保证金是否足够"""
@@ -181,8 +196,12 @@ class UnifiedArbitrageStrategy:
             rprint(f"[red]❌ 获取{exchange.name}智能价格失败: {e}[/red]")
             return None
 
-    async def get_spread(self, symbol: str) -> Tuple[float, float, float]:
-        """获取双向价差"""
+    async def get_spread(self, symbol: str) -> Tuple[float, float, float, float, float]:
+        """获取双向价差和价格信息
+
+        Returns:
+            Tuple[spread_1, spread_2, best_spread, price_a_mid, price_b_mid]
+        """
         try:
             # 并行获取两个交易所的盘口数据
             book_a, book_b = await asyncio.gather(
@@ -192,6 +211,10 @@ class UnifiedArbitrageStrategy:
 
             if not book_a or not book_b:
                 raise Exception("无法获取盘口数据")
+
+            # 计算中间价
+            price_a_mid = (float(book_a["bids"][0][0]) + float(book_a["asks"][0][0])) / 2
+            price_b_mid = (float(book_b["bids"][0][0]) + float(book_b["asks"][0][0])) / 2
 
             # 计算两个方向的价差
             # 方向1: A买入 -> B卖出
@@ -206,37 +229,86 @@ class UnifiedArbitrageStrategy:
 
             best_spread = max(spread_1, spread_2)
 
-            return spread_1, spread_2, best_spread
+            return spread_1, spread_2, best_spread, price_a_mid, price_b_mid
 
         except Exception as e:
             rprint(f"[red]❌ 获取价差失败: {e}[/red]")
-            return 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0, 0.0
 
-    def determine_trading_direction(self, spread_1: float, spread_2: float) -> Tuple[str, str]:
-        """确定交易方向"""
-        if abs(spread_1) < self.min_spread and abs(spread_2) < self.min_spread:
-            # 刷量模式：随机选择方向
-            import random
-            return random.choice([("buy", "sell"), ("sell", "buy")])
+    def determine_trading_direction(self, price_a_mid: float, price_b_mid: float) -> Tuple[str, str, str]:
+        """根据价差阈值确定交易方向
 
-        if spread_1 > spread_2:
-            return ("buy", "sell")  # A买入，B卖出
+        策略说明：
+        1. 当两所价差 > 75: 相向下单（高价所做空，低价所做多），价差收缩时平仓获利
+        2. 当两所价差 < 60: 反向下单（高价所做多，低价所做空），价差扩大时平仓获利
+
+        Returns:
+            Tuple[side_a, side_b, strategy_type]
+            strategy_type: "convergence"(相向) 或 "divergence"(反向)
+        """
+        # 计算绝对价差
+        price_diff = abs(price_a_mid - price_b_mid)
+
+        if price_diff > self.spread_threshold_open:
+            # 价差>75: 相向下单策略 - 价差收缩获利
+            if price_a_mid > price_b_mid:
+                # A价格高，B价格低 -> A做空，B做多
+                rprint(f"[green]📈 相向下单策略: 价差{price_diff:.2f} > {self.spread_threshold_open}[/green]")
+                rprint(f"[cyan]   {self.exchange_a.name}(${price_a_mid:.2f})做空 + {self.exchange_b.name}(${price_b_mid:.2f})做多[/cyan]")
+                return ("sell", "buy", "convergence")
+            else:
+                # B价格高，A价格低 -> A做多，B做空
+                rprint(f"[green]📈 相向下单策略: 价差{price_diff:.2f} > {self.spread_threshold_open}[/green]")
+                rprint(f"[cyan]   {self.exchange_a.name}(${price_a_mid:.2f})做多 + {self.exchange_b.name}(${price_b_mid:.2f})做空[/cyan]")
+                return ("buy", "sell", "convergence")
+
+        elif price_diff < self.spread_threshold_reverse:
+            # 价差<60: 反向下单策略 - 价差扩大获利
+            if price_a_mid > price_b_mid:
+                # A价格高，B价格低 -> A做多，B做空（押注价差扩大）
+                rprint(f"[yellow]📉 反向下单策略: 价差{price_diff:.2f} < {self.spread_threshold_reverse}[/yellow]")
+                rprint(f"[cyan]   {self.exchange_a.name}(${price_a_mid:.2f})做多 + {self.exchange_b.name}(${price_b_mid:.2f})做空[/cyan]")
+                return ("buy", "sell", "divergence")
+            else:
+                # B价格高，A价格低 -> A做空，B做多（押注价差扩大）
+                rprint(f"[yellow]📉 反向下单策略: 价差{price_diff:.2f} < {self.spread_threshold_reverse}[/yellow]")
+                rprint(f"[cyan]   {self.exchange_a.name}(${price_a_mid:.2f})做空 + {self.exchange_b.name}(${price_b_mid:.2f})做多[/cyan]")
+                return ("sell", "buy", "divergence")
+
         else:
-            return ("sell", "buy")  # A卖出，B买入
+            # 价差在60-75之间：不开仓
+            rprint(f"[dim]⏸️  价差{price_diff:.2f}在阈值区间[{self.spread_threshold_reverse}-{self.spread_threshold_open}]，暂不开仓[/dim]")
+            return (None, None, None)
 
     async def execute_arbitrage(self, symbol: str, amount: float, real_trade: bool = False) -> bool:
         """执行套利交易"""
         try:
             rprint(f"[blue]🔄 开始执行{self.exchange_a.name}+{self.exchange_b.name}套利交易: {symbol}[/blue]")
 
+            # 持续监控价差，等待符合开仓条件
+            rprint(f"[cyan]📡 开始监控价差，等待开仓时机...[/cyan]")
 
-            # 获取价差信息
-            spread_1, spread_2, best_spread = await self.get_spread(symbol)
+            side_a, side_b, strategy_type = None, None, None
+            wait_count = 0
 
-            # 确定交易方向
-            side_a, side_b = self.determine_trading_direction(spread_1, spread_2)
+            while side_a is None or side_b is None:
+                # 获取价差信息
+                spread_1, spread_2, best_spread, price_a_mid, price_b_mid = await self.get_spread(symbol)
 
-            rprint(f"[cyan]📊 交易方向: {self.exchange_a.name}{side_a} | {self.exchange_b.name}{side_b}[/cyan]")
+                # 确定交易方向（基于价差阈值）
+                side_a, side_b, strategy_type = self.determine_trading_direction(price_a_mid, price_b_mid)
+
+                # 如果不满足开仓条件，继续等待
+                if side_a is None or side_b is None:
+                    wait_count += 1
+                    if wait_count % 10 == 0:  # 每10次输出一次状态
+                        current_diff = abs(price_a_mid - price_b_mid)
+                        rprint(f"[dim]⏳ 等待开仓时机...当前价差{current_diff:.2f}，需>75或<60 ({wait_count}次)[/dim]")
+                    await asyncio.sleep(0.5)  # 等待500ms再检查
+                    continue
+
+            rprint(f"[green]✅ 发现开仓机会！[/green]")
+            rprint(f"[cyan]📊 交易方向: {self.exchange_a.name} {side_a} | {self.exchange_b.name} {side_b} ({strategy_type})[/cyan]")
 
             # 获取盘口价格
             rprint(f"[dim]🔍 获取盘口数据...[/dim]")
@@ -275,7 +347,8 @@ class UnifiedArbitrageStrategy:
                 entry_price_a=price_a,
                 entry_price_b=price_b,
                 entry_spread=entry_spread,
-                entry_time=datetime.now()
+                entry_time=datetime.now(),
+                strategy_type=strategy_type
             )
 
             if real_trade:
@@ -325,17 +398,81 @@ class UnifiedArbitrageStrategy:
             rprint(f"[red]❌ 套利执行失败: {e}[/red]")
             return False
 
-    async def _place_limit_order(self, exchange, side: str, amount: float) -> Dict:
-        """下限价单 - 使用新定义的智能价格"""
+    async def _place_limit_order_with_chase(self, exchange, side: str, amount: float, max_retries: int = 5) -> Dict:
+        """下限价单 - 带追击盘口功能
+
+        如果限价单价格不再是当前盘口最优价，会撤单重新下单
+
+        Args:
+            exchange: 交易所对象
+            side: 方向 buy/sell
+            amount: 数量
+            max_retries: 最大重试次数
+        """
         try:
-            # 获取限价单价格（Maker价格）
-            price = await self._get_smart_order_price(exchange, side, "limit")
-            if not price:
-                raise Exception("获取限价单价格失败")
+            chase_count = 0
+            last_order = None
 
-            rprint(f"[cyan]📋 {exchange.name} {side} 限价单价格: ${price:,.2f}[/cyan]")
+            while chase_count <= max_retries:
+                # 获取当前最优价格
+                current_price = await self._get_smart_order_price(exchange, side, "limit")
+                if not current_price:
+                    raise Exception("获取限价单价格失败")
 
-            # 根据交易所名称调用不同的API
+                # 下单
+                if chase_count == 0:
+                    rprint(f"[cyan]📋 {exchange.name} {side} 限价单价格: ${current_price:,.2f}[/cyan]")
+                else:
+                    rprint(f"[cyan]🔄 {exchange.name}追击盘口重新下单(第{chase_count}次): ${current_price:,.2f}[/cyan]")
+
+                order = await self._place_order_internal(exchange, side, amount, current_price)
+
+                if not order or not order.get('order_id'):
+                    raise Exception(f"下单失败: {order}")
+
+                order_id = order.get('order_id')
+                last_order = order
+                rprint(f"[green]✅ {exchange.name}限价单已提交，订单ID: {order_id}[/green]")
+
+                # 等待100ms后检查订单状态
+                await asyncio.sleep(0.1)
+
+                # 检查订单是否快速成交
+                status = await self._get_order_status(exchange, order_id)
+                if status and self._is_order_filled(status):
+                    rprint(f"[green]🎯 {exchange.name}订单快速成交！[/green]")
+                    return order
+
+                # 检查盘口价格是否变化
+                new_price = await self._get_smart_order_price(exchange, side, "limit")
+                if new_price and abs(new_price - current_price) > 0.01:
+                    # 价格变化，需要追击
+                    if chase_count < max_retries:
+                        rprint(f"[yellow]🔄 {exchange.name}盘口价格变化: ${current_price:,.2f} -> ${new_price:,.2f}，追击盘口...[/yellow]")
+                        # 撤销旧订单
+                        await self._cancel_order(exchange, order_id)
+                        await asyncio.sleep(0.05)  # 等待50ms确保撤单完成
+                        chase_count += 1
+                        continue
+                    else:
+                        # 达到最大追击次数，不再撤单
+                        rprint(f"[yellow]⚠️ {exchange.name}盘口仍在变化，但已达最大追击次数({max_retries})，保留当前订单[/yellow]")
+                        return order
+
+                # 价格未变化，订单有效
+                rprint(f"[green]✅ {exchange.name}限价单价格稳定，保留订单[/green]")
+                return order
+
+            # 理论上不应到达这里
+            return last_order
+
+        except Exception as e:
+            rprint(f"[red]❌ {exchange.name}限价单追击失败: {e}[/red]")
+            return None
+
+    async def _place_order_internal(self, exchange, side: str, amount: float, price: float) -> Dict:
+        """内部下单方法"""
+        try:
             if exchange.name.lower() == 'aster':
                 return await exchange.adapter.place_order(
                     exchange.symbol, side, amount, price, "limit", self.leverage
@@ -349,13 +486,16 @@ class UnifiedArbitrageStrategy:
                     exchange.symbol, side, amount, price, "limit", self.leverage
                 )
             else:
-                # 默认API调用
                 return await exchange.adapter.place_order(
                     exchange.symbol, side, amount, price, "limit"
                 )
         except Exception as e:
-            rprint(f"[red]❌ {exchange.name}限价单失败: {e}[/red]")
+            rprint(f"[red]❌ {exchange.name}下单失败: {e}[/red]")
             return None
+
+    async def _place_limit_order(self, exchange, side: str, amount: float) -> Dict:
+        """下限价单 - 使用追击盘口功能"""
+        return await self._place_limit_order_with_chase(exchange, side, amount, max_retries=3)
 
     async def _place_order_for_exchange(self, exchange, side: str, amount: float, price: float = None) -> Dict:
         """根据交易所特性下单（兼容旧方法）"""
@@ -473,11 +613,22 @@ class UnifiedArbitrageStrategy:
                         # 获取市价对冲时的实际价格
                         market_price = await self._get_smart_order_price(position.exchange_b, position.side_b, "market")
                         market_order = await self._place_market_order(position.exchange_b, position.side_b, position.amount)
+
                         if market_order:
-                            filled_b = True
-                            # 记录实际市价对冲价格
-                            position._actual_price_b = market_price
-                            rprint(f"[green]🎯 {position.exchange_b.name}V1市价对冲完成！[/green]")
+                            order_id = market_order.get('id') or market_order.get('order_id')
+                            if order_id:
+                                # 🔥 强制等待订单成交，失败则重试
+                                rprint(f"[yellow]⏳ 强制等待{position.exchange_b.name}市价对冲成交...[/yellow]")
+                                is_filled = await self._wait_for_order_fill_with_retry(
+                                    position.exchange_b, order_id, position.side_b, position.amount, max_retries=3
+                                )
+                                if is_filled:
+                                    filled_b = True
+                                    position._actual_price_b = market_price
+                                    rprint(f"[green]🎯 {position.exchange_b.name}V1市价对冲完成！[/green]")
+                                else:
+                                    rprint(f"[red]🚨 {position.exchange_b.name}市价对冲失败！持仓不平衡！[/red]")
+                                    return False
                         break
 
                 elif status_b and self._is_order_filled(status_b) and not filled_b:
@@ -489,11 +640,22 @@ class UnifiedArbitrageStrategy:
                         # 获取市价对冲时的实际价格
                         market_price = await self._get_smart_order_price(position.exchange_a, position.side_a, "market")
                         market_order = await self._place_market_order(position.exchange_a, position.side_a, position.amount)
+
                         if market_order:
-                            filled_a = True
-                            # 记录实际市价对冲价格
-                            position._actual_price_a = market_price
-                            rprint(f"[green]🎯 {position.exchange_a.name}V1市价对冲完成！[/green]")
+                            order_id = market_order.get('id') or market_order.get('order_id')
+                            if order_id:
+                                # 🔥 强制等待订单成交，失败则重试
+                                rprint(f"[yellow]⏳ 强制等待{position.exchange_a.name}市价对冲成交...[/yellow]")
+                                is_filled = await self._wait_for_order_fill_with_retry(
+                                    position.exchange_a, order_id, position.side_a, position.amount, max_retries=3
+                                )
+                                if is_filled:
+                                    filled_a = True
+                                    position._actual_price_a = market_price
+                                    rprint(f"[green]🎯 {position.exchange_a.name}V1市价对冲完成！[/green]")
+                                else:
+                                    rprint(f"[red]🚨 {position.exchange_a.name}市价对冲失败！持仓不平衡！[/red]")
+                                    return False
                         break
 
                 # 每50次检查输出一次状态日志（因为频率提高了一倍）
@@ -657,8 +819,85 @@ class UnifiedArbitrageStrategy:
             rprint(f"[yellow]⚠️ 验证{exchange.name}订单成交失败: {e}[/yellow]")
             return False
 
+    async def _wait_for_order_fill_with_retry(self, exchange, order_id: str, side: str, amount: float, max_retries: int = 3) -> bool:
+        """强制等待订单成交，失败则重试更激进的市价单
+
+        Args:
+            exchange: 交易所对象
+            order_id: 初始订单ID
+            side: 方向
+            amount: 数量
+            max_retries: 最大重试次数
+
+        Returns:
+            bool: 是否最终成交
+        """
+        try:
+            current_order_id = order_id
+
+            for retry in range(max_retries):
+                # 等待当前订单成交（最多30秒）
+                start_time = time.time()
+                check_interval = 0.2
+                max_wait = 30.0
+
+                while time.time() - start_time < max_wait:
+                    status = await self._get_order_status(exchange, current_order_id)
+                    if status and self._is_order_filled(status):
+                        rprint(f"[green]✅ {exchange.name}订单最终成交确认！[/green]")
+                        return True
+                    await asyncio.sleep(check_interval)
+
+                # 30秒未成交
+                rprint(f"[red]❌ {exchange.name}订单{current_order_id}在30s内未成交，第{retry+1}次重试[/red]")
+
+                if retry < max_retries - 1:
+                    # 撤销当前订单
+                    await self._cancel_order(exchange, current_order_id)
+                    await asyncio.sleep(0.2)
+
+                    # 获取更激进的市价
+                    book = await self._get_fresh_orderbook(exchange, force_refresh=True)
+                    if not book:
+                        rprint(f"[red]❌ 无法获取盘口，无法重试[/red]")
+                        return False
+
+                    # 更激进的定价：直接穿透10档
+                    if side == "buy":
+                        if len(book["asks"]) >= 10:
+                            aggressive_price = float(book["asks"][9][0]) * 1.002  # 卖10价再加0.2%
+                        else:
+                            aggressive_price = float(book["asks"][-1][0]) * 1.005  # 最后价格再加0.5%
+                    else:
+                        if len(book["bids"]) >= 10:
+                            aggressive_price = float(book["bids"][9][0]) * 0.998  # 买10价再减0.2%
+                        else:
+                            aggressive_price = float(book["bids"][-1][0]) * 0.995  # 最后价格再减0.5%
+
+                    rprint(f"[yellow]🔥 {exchange.name}使用超激进市价重试: {side} {amount} @${aggressive_price:,.2f}[/yellow]")
+
+                    # 重新下单
+                    retry_order = await self._place_order_internal(exchange, side, amount, aggressive_price)
+                    if retry_order and retry_order.get('order_id'):
+                        current_order_id = retry_order.get('order_id')
+                    else:
+                        rprint(f"[red]❌ 重试下单失败[/red]")
+                        return False
+
+            # 达到最大重试次数仍未成交
+            rprint(f"[red]🚨 {exchange.name}达到最大重试次数({max_retries})，订单仍未成交！[/red]")
+            return False
+
+        except Exception as e:
+            rprint(f"[red]❌ 强制等待订单成交异常: {e}[/red]")
+            return False
+
     async def start_monitoring(self):
         """启动持仓监控"""
+        if self.monitoring_active:
+            rprint("[yellow]⚠️  监控已在运行中，避免重复启动[/yellow]")
+            return
+
         self.monitoring_active = True
         rprint("[blue]🚀 统一套利监控启动[/blue]")
 
@@ -675,42 +914,191 @@ class UnifiedArbitrageStrategy:
                     self.monitoring_active = False
                     break
 
+                # 逐个检查持仓状态（避免并发导致重复日志）
                 for position in active_positions:
-                    # 检查持仓时间和价差变化
                     await self._check_position_status(position)
 
-                await asyncio.sleep(0.5)  # 避免过于频繁的检查
+                # 增加间隔到1秒，避免过于频繁（原500ms可能导致重复触发）
+                await asyncio.sleep(1.0)
 
             except Exception as e:
                 rprint(f"[red]❌ 监控异常: {e}[/red]")
                 await asyncio.sleep(5)
 
     async def _check_position_status(self, position: ArbitragePosition):
-        """检查持仓状态"""
+        """检查持仓状态 - 基于策略类型判断平仓"""
         try:
-            # 获取当前价差
-            spread_1, spread_2, current_spread = await self.get_spread(position.symbol)
-
             # 持仓时间
             position_time = (datetime.now() - position.entry_time).total_seconds()
+            position_time_int = int(position_time)
+
+            # 🔒 最小持仓时间保护：开仓后1分钟内不判断平仓条件，也不请求盘口
+            if position_time < self.min_hold_time:
+                # 保护期内只显示简单信息，不请求价差（每10秒显示一次，避免刷屏）
+                if position_time_int % 10 == 0 and position_time_int != getattr(position, '_last_log_time', -1):
+                    rprint(f"[yellow]🔒 持仓保护期: 已持仓{position_time_int}秒/{self.min_hold_time}秒，暂不判断平仓[/yellow]")
+                    position._last_log_time = position_time_int  # 记录已显示的时间点
+                return
+
+            # 🔥 加仓逻辑检查（保护期结束后，且未加过仓）
+            if (self.allow_add_position and
+                not self.has_added_position and
+                position_time >= self.add_position_hold_time):
+                # 检查价差是否满足加仓条件
+                spread_1, spread_2, current_spread, price_a_mid, price_b_mid = await self.get_spread(position.symbol)
+                current_price_diff = abs(price_a_mid - price_b_mid)
+
+                # 根据策略类型判断是否加仓
+                should_add = False
+
+                if position.strategy_type == "convergence":
+                    # 相向策略：价差进一步扩大(>原价差120%)时加仓，降低平均成本
+                    add_threshold = position.entry_spread * 1.2
+                    if current_price_diff > add_threshold:
+                        should_add = True
+                        rprint(f"[yellow]🔥 相向加仓信号: 价差{current_price_diff:.2f} > {add_threshold:.2f}(原价差{position.entry_spread:.2f}×120%)，执行加仓降低成本[/yellow]")
+
+                elif position.strategy_type == "divergence":
+                    # 反向策略：价差进一步缩小(<原价差80%)时加仓，降低平均成本
+                    add_threshold = position.entry_spread * 0.8
+                    if current_price_diff < add_threshold:
+                        should_add = True
+                        rprint(f"[yellow]🔥 反向加仓信号: 价差{current_price_diff:.2f} < {add_threshold:.2f}(原价差{position.entry_spread:.2f}×80%)，执行加仓降低成本[/yellow]")
+
+                if should_add:
+                    await self._add_position(position, current_price_diff)
+                    self.has_added_position = True  # 标记已加仓，不再重复
+                    return
+
+            # 保护期结束后才获取价差信息进行平仓判断
+            spread_1, spread_2, current_spread, price_a_mid, price_b_mid = await self.get_spread(position.symbol)
+
+            # 检查是否获取价差失败（API异常）
+            if price_a_mid == 0 or price_b_mid == 0:
+                rprint(f"[red]⚠️  价差获取失败，跳过本次平仓检查[/red]")
+                return
+
+            # 当前绝对价差
+            current_price_diff = abs(price_a_mid - price_b_mid)
 
             rprint(f"[dim]📊 持仓监控: {position.exchange_a.name}+{position.exchange_b.name}, "
-                  f"时间{position_time:.0f}s, 当前价差{current_spread:.2f}[/dim]")
+                  f"时间{position_time:.0f}s, 入场价差{position.entry_spread:.2f}, 当前价差{current_price_diff:.2f}, 策略{position.strategy_type}[/dim]")
 
-            # 简单的平仓逻辑：持仓超过5分钟或价差回归
             should_close = False
-            if position_time > 300:  # 5分钟
-                should_close = True
-                rprint(f"[yellow]⏰ 持仓时间过长，准备平仓[/yellow]")
-            elif current_spread < position.entry_spread * 0.5:  # 价差回归50%
-                should_close = True
-                rprint(f"[green]📈 价差回归，准备平仓[/green]")
+
+            if position.strategy_type == "convergence":
+                # 相向策略：价差收缩时平仓获利
+                # 入场价差 > 75，当前价差 < 入场价差×90% 就平仓
+                target_spread = position.entry_spread * 0.9
+                if current_price_diff < target_spread:
+                    should_close = True
+                    profit_diff = position.entry_spread - current_price_diff
+                    rprint(f"[green]📈 相向策略平仓: 价差从{position.entry_spread:.2f}收缩至{current_price_diff:.2f}（目标<{target_spread:.2f}），获利价差{profit_diff:.2f}[/green]")
+
+            elif position.strategy_type == "divergence":
+                # 反向策略：价差扩大时平仓获利
+                # 入场价差 < 60，当前价差 > 入场价差×110% 就平仓
+                target_spread = position.entry_spread * 1.1
+                if current_price_diff > target_spread:
+                    should_close = True
+                    profit_diff = current_price_diff - position.entry_spread
+                    rprint(f"[green]📉 反向策略平仓: 价差从{position.entry_spread:.2f}扩大至{current_price_diff:.2f}（目标>{target_spread:.2f}），获利价差{profit_diff:.2f}[/green]")
 
             if should_close:
                 await self._close_position(position)
 
         except Exception as e:
             rprint(f"[red]❌ 检查持仓状态失败: {e}[/red]")
+
+    async def _add_position(self, position: ArbitragePosition, current_spread: float):
+        """加仓降低成本 - 完全复用开仓逻辑"""
+        try:
+            rprint(f"[yellow]🔥 执行加仓操作: 当前价差{current_spread:.2f}，原入场价差{position.entry_spread:.2f}[/yellow]")
+
+            # 使用与原仓位相同的方向和数量
+            side_a = position.side_a
+            side_b = position.side_b
+            amount = position.amount
+
+            # 获取盘口数据
+            book_a = await self.exchange_a.adapter.get_orderbook(self.exchange_a.symbol, 5)
+            book_b = await self.exchange_b.adapter.get_orderbook(self.exchange_b.symbol, 5)
+
+            if not book_a or not book_b:
+                rprint(f"[red]❌ 加仓失败: 无法获取盘口数据[/red]")
+                return
+
+            # 获取加仓价格
+            if side_a == "buy":
+                price_a = float(book_a["bids"][0][0])
+            else:
+                price_a = float(book_a["asks"][0][0])
+
+            if side_b == "buy":
+                price_b = float(book_b["bids"][0][0])
+            else:
+                price_b = float(book_b["asks"][0][0])
+
+            add_spread = abs(price_a - price_b)
+            rprint(f"[cyan]💰 加仓价格 - {self.exchange_a.name}: ${price_a:,.2f}, {self.exchange_b.name}: ${price_b:,.2f}, 价差: {add_spread:.2f}[/cyan]")
+
+            # 下智能限价单
+            order_a = await self._place_limit_order(self.exchange_a, side_a, amount)
+            order_b = await self._place_limit_order(self.exchange_b, side_b, amount)
+
+            if not order_a or not order_b:
+                rprint(f"[red]❌ 加仓限价单下单失败[/red]")
+                return
+
+            order_id_a = order_a.get('id') or order_a.get('order_id')
+            order_id_b = order_b.get('id') or order_b.get('order_id')
+
+            rprint(f"[green]✅ 加仓限价单提交成功![/green]")
+            rprint(f"{self.exchange_a.name}加仓订单ID: {order_id_a}")
+            rprint(f"{self.exchange_b.name}加仓订单ID: {order_id_b}")
+
+            # 🔥 创建临时加仓Position对象，复用V1监控对冲逻辑
+            add_position = ArbitragePosition(
+                symbol=position.symbol,
+                amount=amount,
+                leverage=self.leverage,
+                exchange_a=self.exchange_a,
+                exchange_b=self.exchange_b,
+                side_a=side_a,
+                side_b=side_b,
+                entry_price_a=price_a,
+                entry_price_b=price_b,
+                entry_spread=add_spread,
+                entry_time=datetime.now(),
+                strategy_type=position.strategy_type,
+                order_id_a=order_id_a,
+                order_id_b=order_id_b,
+                status="pending"
+            )
+
+            # 使用V1策略监控：一方成交立即市价对冲另一方
+            success = await self._monitor_and_hedge(add_position)
+
+            if success:
+                # 加仓成功，更新原仓位信息（加权平均）
+                old_amount = position.amount
+                old_spread = position.entry_spread  # 保存原价差用于显示
+                new_amount = old_amount + amount
+
+                # 加权平均计算新的入场价差
+                weighted_spread = (old_spread * old_amount + add_spread * amount) / new_amount
+
+                # 更新仓位信息
+                position.entry_spread = weighted_spread
+                position.amount = new_amount
+
+                rprint(f"[green]🎉 加仓成功！原仓位{old_amount}，加仓{amount}，新持仓{new_amount}[/green]")
+                rprint(f"[green]   原入场价差{old_spread:.2f} + 加仓价差{add_spread:.2f} → 新入场价差{weighted_spread:.2f}[/green]")
+            else:
+                rprint(f"[red]❌ 加仓失败: V1对冲未完成[/red]")
+
+        except Exception as e:
+            rprint(f"[red]❌ 加仓异常: {e}[/red]")
 
     async def _close_position(self, position: ArbitragePosition):
         """平仓 - 使用与开仓一致的限价+市价逻辑"""
@@ -770,9 +1158,21 @@ class UnifiedArbitrageStrategy:
                         if not filled_b:
                             await self._cancel_order(position.exchange_b, close_order_id_b)
                             market_order = await self._place_market_order(position.exchange_b, close_side_b, position.amount)
+
                             if market_order:
-                                filled_b = True
-                                rprint(f"[green]🎯 {position.exchange_b.name}平仓市价对冲完成！[/green]")
+                                order_id = market_order.get('id') or market_order.get('order_id')
+                                if order_id:
+                                    # 🔥 强制等待订单成交，失败则重试
+                                    rprint(f"[yellow]⏳ 强制等待{position.exchange_b.name}平仓市价对冲成交...[/yellow]")
+                                    is_filled = await self._wait_for_order_fill_with_retry(
+                                        position.exchange_b, order_id, close_side_b, position.amount, max_retries=3
+                                    )
+                                    if is_filled:
+                                        filled_b = True
+                                        rprint(f"[green]🎯 {position.exchange_b.name}平仓市价对冲完成！[/green]")
+                                    else:
+                                        rprint(f"[red]🚨 {position.exchange_b.name}平仓市价对冲失败！平仓不完整！[/red]")
+                                        return False
                             break
 
                     elif status_b and self._is_order_filled(status_b) and not filled_b:
@@ -782,9 +1182,21 @@ class UnifiedArbitrageStrategy:
                         if not filled_a:
                             await self._cancel_order(position.exchange_a, close_order_id_a)
                             market_order = await self._place_market_order(position.exchange_a, close_side_a, position.amount)
+
                             if market_order:
-                                filled_a = True
-                                rprint(f"[green]🎯 {position.exchange_a.name}平仓市价对冲完成！[/green]")
+                                order_id = market_order.get('id') or market_order.get('order_id')
+                                if order_id:
+                                    # 🔥 强制等待订单成交，失败则重试
+                                    rprint(f"[yellow]⏳ 强制等待{position.exchange_a.name}平仓市价对冲成交...[/yellow]")
+                                    is_filled = await self._wait_for_order_fill_with_retry(
+                                        position.exchange_a, order_id, close_side_a, position.amount, max_retries=3
+                                    )
+                                    if is_filled:
+                                        filled_a = True
+                                        rprint(f"[green]🎯 {position.exchange_a.name}平仓市价对冲完成！[/green]")
+                                    else:
+                                        rprint(f"[red]🚨 {position.exchange_a.name}平仓市价对冲失败！平仓不完整！[/red]")
+                                        return False
                             break
 
                     # 每50次检查输出一次状态日志
